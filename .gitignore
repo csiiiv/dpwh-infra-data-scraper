@@ -6,9 +6,12 @@ __pycache__/
 # C extensions
 *.so
 
-xlsx/*
+#source data dir
+xlsx/
+csv/misc/
+
+# source html data dir can be extracted from html.7z
 html/*
-csv/misc/*
 
 # Distribution / packaging
 .Python
@@ -73,9 +76,6 @@ coverage.xml
 logs/
 *.log
 
-# Data outputs
-csv/
-
 # Docs build
 _build/
 
@@ -90,5 +90,3 @@ Thumbs.db
 *.swp
 *~
 
-# Ignore HTML input files
-html/
