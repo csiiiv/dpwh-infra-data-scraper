@@ -175,22 +175,23 @@ for tbody in tbodies:
 - **Action:** Parse to ISO format (YYYY-MM-DD)
 - **Library:** Use `dateutil.parser` or `datetime.strptime`
 
-### 3. Contractor Names
-- **Format:** Name with ID code in parentheses; multiple contractors separated by ` / `
-- **Single Contractor Example:** `"CHINA WUYI CO., LTD (OECO_16634)"`
-- **Multiple Contractors Example:** `"ULTICON BUILDERS, INC. (17267) / SHIMIZU CORPORATION (OECO_16693) / TAKENAKA CIVIL ENGINEERING & CONSTRUCTION CO., LTD. (OECO_29591)"`
-- **Action:** Split into separate columns for each contractor:
-  - Contractor Name 1: `"CHINA WUYI CO., LTD"` or `"ULTICON BUILDERS, INC."`
-  - Contractor ID 1: `"OECO_16634"` or `"17267"`
-  - Contractor Name 2: `None` or `"SHIMIZU CORPORATION"`
-  - Contractor ID 2: `None` or `"OECO_16693"`
-  - Contractor Name 3: `None` or `"TAKENAKA CIVIL ENGINEERING & CONSTRUCTION CO., LTD."`
-  - Contractor ID 3: `None` or `"OECO_29591"`
-- **Strategy:** 
-  1. Split by ` / ` delimiter to get individual contractors
-  2. Extract name and ID from each contractor using regex: `^(.+?)\s*\(([^)]+)\)\s*$`
-  3. Store in separate columns (contractor_name_1, contractor_id_1, contractor_name_2, contractor_id_2, etc.)
-  4. Leave additional columns empty if fewer contractors exist
+### 3. Contractor Names (revised)
+**Problem:** Some contractor names include forward slashes (`/`) as part of the legal/business name (for example, "A / B Builders") while the joint-venture separator in the HTML is actually a `") /"` sequence (a closing parenthesis, space, slash). A naive split on `/` breaks contractor names that legitimately contain `/`.
+
+**Updated strategy (implemented in `scripts/html_to_csv_parser.py`):**
+- Split on the separator pattern `") /"` (implemented with the regex `r"\)\s*/\s*"`) so that we only split between contractor entries and not within names.
+- After splitting, re-add the removed closing `)` for all but the last piece (the split removes the `)`), so each contractor string ends with the original `)` to ease regex extraction.
+- Extract name and ID with the regex `^(.+?)\s*\(([^)]+)\)\s*$`.
+- Preserve slashes inside contractor names and *flag* names that contain stray slashes for manual review.
+- If more contractors are present than available columns (we store up to 4 contractor columns), combine the 4th+ contractors into the last contractor column using `; ` as a separator and emit a `WARN-041` warning.
+
+**Single Contractor Example:**
+`"CHINA WUYI CO., LTD (OECO_16634)"`
+
+**Multiple Contractors Example (preserves slashes inside names):**
+`"ULTICON BUILDERS, INC. (17267) / SHIMIZU CORPORATION (OECO_16693) / TAKENAKA CIVIL ENGINEERING & CONSTRUCTION CO., LTD. (OECO_29591)"`
+
+**Outcome:** Contractor names that legitimately include `/` are preserved; true JV separators `") /"` split entries correctly; missing IDs are detected and flagged.
 
 ### 4. % Accomplishment
 - **Format:** Decimal string (e.g., `"100.00"`) or empty
@@ -230,11 +231,19 @@ for tbody in tbodies:
 ```
 **Handling:** Ignore or skip during parsing
 
-### 4. Multiple Contractors (Joint Ventures)
+### 5. Multiple Contractors (Joint Ventures)
 ```html
 <span id="Repeater1_lblCountry_0"> ULTICON BUILDERS, INC. (17267) / SHIMIZU CORPORATION (OECO_16693) / TAKENAKA CIVIL ENGINEERING &amp; CONSTRUCTION CO., LTD. (OECO_29591)</span>
 ```
-**Handling:** Split by ` / ` delimiter, extract each contractor's name and ID separately, then store in separate columns (contractor_name_1, contractor_id_1, contractor_name_2, contractor_id_2, contractor_name_3, contractor_id_3). If more than 3 contractors exist, add a note to `parse_notes` column: `"WARNING: >3 contractors, extras truncated"`
+
+**Handling (revised):**
+- Split using the `") /"` separator (regex `r"\)\s*/\s*"`) to avoid breaking names that contain `/`.
+- For each split piece, restore the closing parenthesis where necessary and extract name and ID via `^(.+?)\s*\(([^)]+)\)\s*$`.
+- Flag any contractor name that still contains `/` (a stray slash) with `WARN-043` for manual review.
+- If more contractors than supported columns are present, combine 4th+ names and IDs into the final contractor column (semicolon-separated) and emit `WARN-041`.
+
+**Example behavior:**
+- Input: `"A / B CONSTRUCTION (123) / C INC (456)"` → this will *not* split the `A / B` part because the separator is `") /"` (closing `)` required). The parser will produce two entries: `("A / B CONSTRUCTION", "123")` and `("C INC", "456")`.
 
 **Examples of Multiple Contractors:**
 - 2 contractors: `"A.M. ORETA & CO., INC. (108) / E. F. CHUA CONSTRUCTION, INC. (37826)"`
@@ -385,73 +394,115 @@ from html import unescape
 
 def parse_contractors(contractor_text):
     """
-    Parse contractor text that may contain single or multiple contractors.
-    Returns list of tuples: [(name1, id1), (name2, id2), ...].
-    
-    Examples:
-        "CHINA WUYI CO., LTD (OECO_16634)" 
-        -> [("CHINA WUYI CO., LTD", "OECO_16634")]
-        
-        "ULTICON BUILDERS, INC. (17267) / SHIMIZU CORPORATION (OECO_16693)"
-        -> [("ULTICON BUILDERS, INC.", "17267"), ("SHIMIZU CORPORATION", "OECO_16693")]
+    Parse contractor text into a list of (name, id, has_stray_slash) tuples.
+
+    This function splits on the true JV separator `") /"` (implemented as
+    the regex `r"\)\s*/\s*"`), which prevents splitting on slashes that
+    are part of contractor names. For all but the last split piece the
+    closing parenthesis is restored before applying the name/ID regex.
+
+    Returns:
+        List[Tuple[name, id_or_None, has_stray_slash_bool]]
     """
     if not contractor_text:
         return []
-    
-    # Decode HTML entities (e.g., &amp; -> &)
+
     contractor_text = unescape(contractor_text.strip())
-    
-    # Split by forward slash to handle multiple contractors
-    contractors = [c.strip() for c in contractor_text.split('/')]
-    
+
+    # Split on ") /" pattern which separates JV partners (preserves slashes in names)
+    contractors = re.split(r'\)\s*/\s*', contractor_text)
+
     result = []
-    
-    for contractor in contractors:
-        # Extract name and ID using regex
-        match = re.match(r'^(.+?)\s*\(([^)]+)\)\s*$', contractor)
+    regex = r'^(.+?)\s*\(([^)]+)\)\s*$'
+
+    for i, contractor in enumerate(contractors):
+        # For all but the last part, the split removed the closing paren — add it back
+        if i < len(contractors) - 1:
+            contractor = contractor + ')'
+
+        contractor = contractor.strip()
+        match = re.match(regex, contractor)
+
         if match:
             name = match.group(1).strip()
             contractor_id = match.group(2).strip()
-            result.append((name, contractor_id))
+            has_slash = '/' in name
+            result.append((name, contractor_id, has_slash))
         else:
-            # No parentheses found, treat entire text as name
-            result.append((contractor, None))
-    
+            # No ID found — keep text as name and mark stray slash if present
+            has_slash = '/' in contractor
+            result.append((contractor, None, has_slash))
+
     return result
 
-def get_contractor_columns(contractor_text, max_contractors=3):
+
+def get_contractor_columns(contractor_text: str, max_contractors: int = 4):
     """
-    Get contractor data as separate columns for CSV output.
-    Returns dict with keys: contractor_name_1, contractor_id_1, etc., 
-    plus parse_notes for any issues.
-    
-    Args:
-        contractor_text: Raw contractor text from HTML
-        max_contractors: Maximum number of contractor columns to support (default: 3)
-    
+    Convert parsed contractors into CSV columns and error/warning notes.
+
+    - First (max_contractors - 1) contractors stored in separate columns.
+    - 4th column (index max_contractors) holds the 4th contractor or a semicolon-separated
+      list when more than max_contractors contractors exist.
+    - Missing IDs and stray slashes are flagged for parse notes.
+
     Returns:
-        Dict with contractor_name_N, contractor_id_N keys (always present),
-        and parse_notes string (empty if no issues)
+        (result_dict, notes_dict) where notes_dict contains 'critical_errors', 'errors', 'warnings', 'info_notes'
     """
-    contractors = parse_contractors(contractor_text)
+    # Note: in the real implementation the ParseNotes and ParseError helpers
+    # are used to collect and format parse warnings/errors. This helper
+    # returns a (result, notes) tuple similar to the script's behavior.
     
+    from html import unescape as _unescape  # local reference (doc-only)
+    
+    # Use the parsing function above
+    contractors = parse_contractors(contractor_text)
     result = {}
     notes = []
-    
-    # Always populate all contractor columns (empty if not present)
-    for i in range(1, max_contractors + 1):
+
+    # Fill first (max_contractors-1) columns
+    for i in range(1, max_contractors):
         if i <= len(contractors):
-            result[f'contractor_name_{i}'] = contractors[i-1][0]
-            result[f'contractor_id_{i}'] = contractors[i-1][1]
+            name, cid, has_slash = contractors[i-1]
+            result[f'contractor_name_{i}'] = name
+            result[f'contractor_id_{i}'] = cid
+            if not cid:
+                notes.append(f"ERR-042: Contractor missing ID code: '{name[:30]}'")
+            if has_slash:
+                notes.append(f"WARN-043: Contractor name contains slash: '{name[:50]}'")
         else:
             result[f'contractor_name_{i}'] = None
             result[f'contractor_id_{i}'] = None
-    
-    # Add note if there are more contractors than columns
-    if len(contractors) > max_contractors:
-        notes.append(f"WARNING: >{max_contractors} contractors ({len(contractors)} total), extras truncated")
-    
-    result['parse_notes'] = ' | '.join(notes) if notes else None
-    
-    return result
+
+    # Combine 4th+ contractors into the final contractor column
+    if len(contractors) >= max_contractors:
+        names = []
+        ids = []
+        for i in range(max_contractors - 1, len(contractors)):
+            name, cid, has_slash = contractors[i]
+            names.append(name)
+            ids.append(cid if cid else '')
+            if not cid:
+                notes.append(f"ERR-042: Contractor missing ID code: '{name[:30]}'")
+            if has_slash:
+                notes.append(f"WARN-043: Contractor name contains slash: '{name[:50]}'")
+
+        result[f'contractor_name_{max_contractors}'] = '; '.join(names)
+        result[f'contractor_id_{max_contractors}'] = '; '.join(ids)
+        if len(contractors) > max_contractors:
+            notes.append(f"WARN-041: {len(contractors)} contractors found, combined into column {max_contractors}")
+    else:
+        result[f'contractor_name_{max_contractors}'] = None
+        result[f'contractor_id_{max_contractors}'] = None
+
+    if len(contractors) > 1:
+        notes.append(f"INFO-045: Joint venture with {len(contractors)} contractors")
+
+    notes_dict = {
+        'critical_errors': None,
+        'errors': ' | '.join([n for n in notes if n.startswith('ERR')]) or None,
+        'warnings': ' | '.join([n for n in notes if n.startswith('WARN')]) or None,
+        'info_notes': ' | '.join([n for n in notes if n.startswith('INFO')]) or None,
+    }
+
+    return result, notes_dict
 ```
