@@ -280,36 +280,46 @@ def parse_contractors(contractor_text: Optional[str]) -> List[Tuple[str, Optiona
     """
     if not contractor_text:
         return []
-    
+
     contractor_text = unescape(contractor_text.strip())
-    
-    # Split on ") /" pattern which separates joint venture partners
-    # This preserves slashes within business names
-    contractors = re.split(r'\)\s*/\s*', contractor_text)
-    
+
+    # Improved splitting: split after (ID) pattern, keeping the ID with the contractor
+    # This regex finds all occurrences of: NAME (FORMER NAME) (ID)
+    # or NAME (ID), and is robust to missing parens in former name
+    contractor_pattern = re.compile(r'(.*?\(.*?\))?\s*\((\d+)\)')
+    matches = list(contractor_pattern.finditer(contractor_text))
+
     result = []
-    regex = r'^(.+?)\s*\(([^)]+)\)\s*$'
-    
-    for i, contractor in enumerate(contractors):
-        # For all but the last contractor, we need to add back the closing paren
-        # because split removes it
-        if i < len(contractors) - 1:
-            contractor = contractor + ')'
-        
-        contractor = contractor.strip()
-        match = re.match(regex, contractor)
-        
-        if match:
-            name = match.group(1).strip()
-            contractor_id = match.group(2).strip()
-            # Check if name has stray slashes
+    last_end = 0
+    for match in matches:
+        full_contractor = contractor_text[last_end:match.end()].strip()
+        last_end = match.end()
+        id_match = re.search(r'\((\d+)\)\s*$', full_contractor)
+        truncated = False
+        if id_match:
+            contractor_id = id_match.group(1)
+            name = full_contractor[:id_match.start()].strip()
+            # Remove any leading or trailing slash and whitespace
+            name = name.lstrip('/').strip()
+            # If unbalanced parens, replace with tilde
+            if name.count('(') != name.count(')'):
+                name = name.rstrip() + '~'
+                truncated = True
             has_slash = '/' in name
-            result.append((name, contractor_id, has_slash))
+            result.append((name, contractor_id, has_slash, truncated))
         else:
-            # No ID found
-            has_slash = '/' in contractor
-            result.append((contractor, None, has_slash))
-    
+            fallback_id = None
+            fallback_name = full_contractor.lstrip('/').strip()
+            fallback_id_match = re.search(r'\((\d+)\)', full_contractor)
+            if fallback_id_match:
+                fallback_id = fallback_id_match.group(1)
+                fallback_name = full_contractor[:fallback_id_match.start()].lstrip('/').strip()
+            has_slash = '/' in fallback_name
+            # Mark as truncated if fallback used
+            truncated = True
+            fallback_name = fallback_name.rstrip() + '~'
+            result.append((fallback_name, fallback_id, has_slash, truncated))
+
     return result
 
 
@@ -349,53 +359,50 @@ def get_contractor_columns(contractor_text: Optional[str], max_contractors: int 
         return result, notes.get_all_columns()
     
     contractors = parse_contractors(contractor_text)
-    
+
     result = {}
-    
+
     # Handle first 3 contractors normally
     for i in range(1, max_contractors):
         if i <= len(contractors):
-            name, contractor_id, has_stray_slash = contractors[i-1]
+            name, contractor_id, has_stray_slash, truncated = contractors[i-1]
             result[f'contractor_name_{i}'] = name
             result[f'contractor_id_{i}'] = contractor_id
-            
             if not contractor_id:
                 notes.add(ParseError.CONTRACTOR_MISSING_ID, name=name[:30] if name else 'Unknown')
-            
             if has_stray_slash:
                 notes.add(ParseError.CONTRACTOR_NAME_HAS_SLASH, name=name[:50] if name else 'Unknown')
+            if truncated:
+                notes.add(("WARN-044", "Contractor name appears truncated: '{name}'"), name=name[:50] if name else 'Unknown')
         else:
             result[f'contractor_name_{i}'] = None
             result[f'contractor_id_{i}'] = None
-    
+
     # Handle 4th contractor and any excess contractors (combine them)
     if len(contractors) >= max_contractors:
-        # Combine contractors from index max_contractors-1 onwards
         names = []
         ids = []
         for i in range(max_contractors - 1, len(contractors)):
-            name, contractor_id, has_stray_slash = contractors[i]
+            name, contractor_id, has_stray_slash, truncated = contractors[i]
             names.append(name)
             ids.append(contractor_id if contractor_id else '')
-            
             if not contractor_id:
                 notes.add(ParseError.CONTRACTOR_MISSING_ID, name=name[:30] if name else 'Unknown')
-            
             if has_stray_slash:
                 notes.add(ParseError.CONTRACTOR_NAME_HAS_SLASH, name=name[:50] if name else 'Unknown')
-        
+            if truncated:
+                notes.add(("WARN-044", "Contractor name appears truncated: '{name}'"), name=name[:50] if name else 'Unknown')
         result[f'contractor_name_{max_contractors}'] = '; '.join(names)
         result[f'contractor_id_{max_contractors}'] = '; '.join(ids)
-        
         if len(contractors) > max_contractors:
             notes.add(ParseError.EXTRA_CONTRACTORS, count=len(contractors))
     else:
         result[f'contractor_name_{max_contractors}'] = None
         result[f'contractor_id_{max_contractors}'] = None
-    
+
     if len(contractors) > 1:
         notes.add(ParseError.JOINT_VENTURE_INFO, count=len(contractors))
-    
+
     return result, notes.get_all_columns()
 
 
@@ -552,21 +559,112 @@ def main(year_filter: Optional[int] = None):
             output_path = csv_dir / f'contracts_{year_filter}_all_offices.csv'
         else:
             output_path = csv_dir / 'contracts_all_years_all_offices.csv'
-        
+
         write_csv(all_contracts, output_path)
-        
+
         # Statistics
         total = len(all_contracts)
         with_critical = sum(1 for c in all_contracts if c.get('critical_errors'))
         with_errors = sum(1 for c in all_contracts if c.get('errors'))
         with_warnings = sum(1 for c in all_contracts if c.get('warnings'))
-        
-        logger.info(f"\n=== Summary ===")
-        logger.info(f"Total contracts: {total}")
-        logger.info(f"Contracts with CRITICAL errors: {with_critical}")
-        logger.info(f"Contracts with ERRORs: {with_errors}")
-        logger.info(f"Contracts with WARNINGs: {with_warnings}")
-        logger.info(f"Clean contracts: {total - with_critical - with_errors - with_warnings}")
+
+        # Count all subtypes for errors, warnings, infos
+        from collections import Counter
+        def split_notes(contracts, col):
+            notes = []
+            for c in contracts:
+                val = c.get(col)
+                if val:
+                    notes.extend([n.strip() for n in val.split('|')])
+            return notes
+
+        crit_counter = Counter()
+        err_counter = Counter()
+        warn_counter = Counter()
+        info_counter = Counter()
+        for c in all_contracts:
+            for note in split_notes([c], 'critical_errors'):
+                if note: crit_counter[note.split(':')[0]] += 1
+            for note in split_notes([c], 'errors'):
+                if note: err_counter[note.split(':')[0]] += 1
+            for note in split_notes([c], 'warnings'):
+                if note: warn_counter[note.split(':')[0]] += 1
+            for note in split_notes([c], 'info_notes'):
+                if note: info_counter[note.split(':')[0]] += 1
+
+        # Message templates for each code (add new codes as needed)
+        MESSAGE_TEMPLATES = {
+            'WARN-041': '{count} contractors found, stored in 4 columns (excess combined in column 4)',
+            'ERR-042': "Contractor missing ID code: '{name}'",
+            'WARN-043': "Contractor missing name, only ID found: '{id}'",
+            'WARN-044': "Contractor name appears truncated: '{name}'",
+            'ERR-044': "Failed to parse contractor text: '{text}'",
+            'INFO-045': 'Joint venture with {count} contractors',
+            'ERR-001': 'Missing contract ID',
+            'ERR-002': 'Missing contract description',
+            'ERR-003': 'Missing contractor information',
+            'ERR-004': 'Missing implementing office',
+            'ERR-005': 'Missing source of funds',
+            'WARN-011': 'Empty cost field',
+            'WARN-012': 'Empty effectivity date',
+            'WARN-013': 'Empty expiry date',
+            'WARN-014': 'Empty status field',
+            'WARN-015': 'Empty accomplishment field',
+            'ERR-021': "Invalid cost format: '{value}'",
+            'ERR-022': 'Negative cost value: {value}',
+            'ERR-023': "Invalid percentage format: '{value}'",
+            'ERR-024': 'Percentage out of range: {value}',
+            'ERR-031': "Invalid effectivity date format: '{value}'",
+            'ERR-032': "Invalid expiry date format: '{value}'",
+            'ERR-033': 'Expiry date before effectivity date',
+            'WARN-034': 'Future effectivity date: {date}',
+            'WARN-035': 'Contract duration > 10 years',
+            # Add more as needed
+        }
+
+        summary_lines = []
+        summary_lines.append(f"# Parse Summary\n")
+        summary_lines.append(f"**Total contracts:** {total}")
+        summary_lines.append(f"**Contracts with CRITICAL errors:** {with_critical}")
+        if crit_counter:
+            summary_lines.append(f"\n## CRITICAL error subtypes:")
+            summary_lines.append(f"| Code | Message Template | Count |")
+            summary_lines.append(f"|------|------------------|-------|")
+            for k, v in crit_counter.items():
+                template = MESSAGE_TEMPLATES.get(k, '')
+                summary_lines.append(f"| {k} | {template} | {v} |")
+        summary_lines.append(f"**Contracts with ERRORs:** {with_errors}")
+        if err_counter:
+            summary_lines.append(f"\n## ERROR subtypes:")
+            summary_lines.append(f"| Code | Message Template | Count |")
+            summary_lines.append(f"|------|------------------|-------|")
+            for k, v in err_counter.items():
+                template = MESSAGE_TEMPLATES.get(k, '')
+                summary_lines.append(f"| {k} | {template} | {v} |")
+        summary_lines.append(f"**Contracts with WARNINGs:** {with_warnings}")
+        if warn_counter:
+            summary_lines.append(f"\n## WARNING subtypes:")
+            summary_lines.append(f"| Code | Message Template | Count |")
+            summary_lines.append(f"|------|------------------|-------|")
+            for k, v in warn_counter.items():
+                template = MESSAGE_TEMPLATES.get(k, '')
+                summary_lines.append(f"| {k} | {template} | {v} |")
+        if info_counter:
+            summary_lines.append(f"\n## INFO subtypes:")
+            summary_lines.append(f"| Code | Message Template | Count |")
+            summary_lines.append(f"|------|------------------|-------|")
+            for k, v in info_counter.items():
+                template = MESSAGE_TEMPLATES.get(k, '')
+                summary_lines.append(f"| {k} | {template} | {v} |")
+        summary_lines.append(f"**Clean contracts:** {total - with_critical - with_errors - with_warnings}")
+
+        # Write summary to markdown file
+        summary_path = csv_dir / (f'parse_summary_{year_filter}.md' if year_filter else 'parse_summary_all_years.md')
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(summary_lines))
+
+        # Also log to console
+        logger.info("\n" + '\n'.join(summary_lines))
     else:
         logger.warning("No contracts extracted!")
 

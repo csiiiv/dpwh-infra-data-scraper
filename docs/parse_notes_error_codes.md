@@ -82,17 +82,21 @@ This document defines all possible errors, warnings, and validation issues that 
 
 ### 4. Contractor Parsing Issues (WARN-041 to ERR-050)
 
-| Code | Issue | Message Template | Example |
-|------|-------|------------------|---------|
-| `WARN-041` | Multiple Contractors | `{count} contractors found, stored in 4 columns (excess combined in column 4)` | `WARN-041: 5 contractors found, stored in 4 columns (excess combined in column 4)` |
-| `ERR-042` | Contractor Format | `Contractor missing ID code: '{name}'` | `ERR-042: Contractor missing ID code: 'ACME CORP'` |
-| `WARN-043` | Contractor Format | `Contractor missing name, only ID found: '{id}'` | `WARN-043: Contractor missing name, only ID found: '12345'` |
-| `ERR-044` | Contractor Parsing | `Failed to parse contractor text: '{text}'` | `ERR-044: Failed to parse contractor text: '((INVALID))'` |
-| `INFO-045` | Joint Venture | `Joint venture with {count} contractors` | `INFO-045: Joint venture with 3 contractors` |
 
-**Handling:** 
+| Code      | Issue                 | Message Template                                              | Example                                                        |
+|-----------|-----------------------|--------------------------------------------------------------|----------------------------------------------------------------|
+| WARN-041  | Multiple Contractors  | {count} contractors found, stored in 4 columns (excess combined in column 4) | WARN-041: 5 contractors found, stored in 4 columns (excess combined in column 4) |
+| ERR-042   | Contractor Format     | Contractor missing ID code: '{name}'                         | ERR-042: Contractor missing ID code: 'ACME CORP'               |
+| WARN-043  | Contractor Format     | Contractor missing name, only ID found: '{id}'               | WARN-043: Contractor missing name, only ID found: '12345'      |
+| WARN-044  | Contractor Truncation | Contractor name appears truncated: '{name}'                  | WARN-044: Contractor name appears truncated: 'TOKWING CONSTRUCTION, CORP.(FOR; TOKWING CONSTRUC~' |
+| ERR-044   | Contractor Parsing    | Failed to parse contractor text: '{text}'                    | ERR-044: Failed to parse contractor text: '((INVALID))'        |
+| INFO-045  | Joint Venture         | Joint venture with {count} contractors                       | INFO-045: Joint venture with 3 contractors                     |
+
+
+**Handling:**
 - WARN-041: Store first 3 contractors normally, combine contractors 4+ in column 4 with semicolons, add warning
 - ERR-042/043: Store available data, add error
+- WARN-044: If contractor name is truncated or has unbalanced/malformed parentheses, output a tilde `~` at the end of the name and add this warning. Remove any leading slashes from succeeding contractor names. Data is preserved as best effort, but flagged for review.
 - ERR-044: Set contractor fields to None, add error
 - INFO-045: Informational only (optional)
 
