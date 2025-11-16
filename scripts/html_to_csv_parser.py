@@ -286,7 +286,8 @@ def parse_contractors(contractor_text: Optional[str]) -> List[Tuple[str, Optiona
     # Improved splitting: split after (ID) pattern, keeping the ID with the contractor
     # This regex finds all occurrences of: NAME (FORMER NAME) (ID)
     # or NAME (ID), and is robust to missing parens in former name
-    contractor_pattern = re.compile(r'(.*?\(.*?\))?\s*\((\d+)\)')
+    # ID can be numeric or alphanumeric with underscores (e.g., OECO_18941)
+    contractor_pattern = re.compile(r'(.*?\(.*?\))?\s*\(([A-Za-z0-9_]+)\)')
     matches = list(contractor_pattern.finditer(contractor_text))
 
     result = []
@@ -294,7 +295,7 @@ def parse_contractors(contractor_text: Optional[str]) -> List[Tuple[str, Optiona
     for match in matches:
         full_contractor = contractor_text[last_end:match.end()].strip()
         last_end = match.end()
-        id_match = re.search(r'\((\d+)\)\s*$', full_contractor)
+        id_match = re.search(r'\(([A-Za-z0-9_]+)\)\s*$', full_contractor)
         truncated = False
         if id_match:
             contractor_id = id_match.group(1)
@@ -310,7 +311,7 @@ def parse_contractors(contractor_text: Optional[str]) -> List[Tuple[str, Optiona
         else:
             fallback_id = None
             fallback_name = full_contractor.lstrip('/').strip()
-            fallback_id_match = re.search(r'\((\d+)\)', full_contractor)
+            fallback_id_match = re.search(r'\(([A-Za-z0-9_]+)\)', full_contractor)
             if fallback_id_match:
                 fallback_id = fallback_id_match.group(1)
                 fallback_name = full_contractor[:fallback_id_match.start()].lstrip('/').strip()
